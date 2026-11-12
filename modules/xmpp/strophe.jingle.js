@@ -1,207 +1,23 @@
-/* global $, $build, __filename */
-
-import { getLogger } from 'jitsi-meet-logger';
+import { getLogger } from '@jitsi/logger';
+import { cloneDeep } from 'lodash-es';
 import { $iq, Strophe } from 'strophe.js';
 
-import * as MediaType from '../../service/RTC/MediaType';
-import {
-    ACTION_JINGLE_TR_RECEIVED,
-    ACTION_JINGLE_TR_SUCCESS,
-    createJingleEvent
-} from '../../service/statistics/AnalyticsEvents';
-import XMPPEvents from '../../service/xmpp/XMPPEvents';
-import FeatureFlags from '../flags/FeatureFlags';
-import Statistics from '../statistics/statistics';
-import GlobalOnErrorHandler from '../util/GlobalOnErrorHandler';
+import { XMPPEvents } from '../../service/xmpp/XMPPEvents';
 import RandomUtil from '../util/RandomUtil';
+import { findAll, findFirst, getAttribute, getText } from '../util/XMLUtils';
 
 import ConnectionPlugin from './ConnectionPlugin';
+import { expandSourcesFromJson } from './JingleHelperFunctions';
 import JingleSessionPC from './JingleSessionPC';
+import { handleStropheError } from './StropheErrorHandler';
 
-const logger = getLogger(__filename);
+const logger = getLogger('xmpp:strophe.jingle');
+
+const OMITTED_CANDIDATE_ATTRIBUTES = [ 'ip', 'rel-addr' ];
 
 // XXX Strophe is build around the idea of chaining function calls so allow long
 // function call chains.
 /* eslint-disable newline-per-chained-call */
-
-/**
- * Creates a "source" XML element for the source described in compact JSON format in [sourceCompactJson].
- * @param {*} owner the endpoint ID of the owner of the source.
- * @param {*} sourceCompactJson the compact JSON representation of the source.
- * @returns the created "source" XML element.
- */
-function _createSourceExtension(owner, sourceCompactJson) {
-    const node = $build('source', {
-        xmlns: 'urn:xmpp:jingle:apps:rtp:ssma:0',
-        ssrc: sourceCompactJson.s,
-        name: FeatureFlags.isSourceNameSignalingEnabled() ? sourceCompactJson.n : undefined
-    });
-
-    if (sourceCompactJson.m) {
-        node.c('parameter', {
-            name: 'msid',
-            value: sourceCompactJson.m
-        }).up();
-    }
-    node.c('ssrc-info', {
-        xmlns: 'http://jitsi.org/jitmeet',
-        owner
-    }).up();
-
-    return node.node;
-}
-
-/**
- * Creates an "ssrc-group" XML element for the SSRC group described in compact JSON format in [ssrcGroupCompactJson].
- * @param {*} ssrcGroupCompactJson the compact JSON representation of the SSRC group.
- * @returns the created "ssrc-group" element.
- */
-function _createSsrcGroupExtension(ssrcGroupCompactJson) {
-    const node = $build('ssrc-group', {
-        xmlns: 'urn:xmpp:jingle:apps:rtp:ssma:0',
-        semantics: _getSemantics(ssrcGroupCompactJson[0])
-    });
-
-    for (let i = 1; i < ssrcGroupCompactJson.length; i++) {
-        node.c('source', {
-            xmlns: 'urn:xmpp:jingle:apps:rtp:ssma:0',
-            ssrc: ssrcGroupCompactJson[i]
-        }).up();
-    }
-
-    return node.node;
-}
-
-/**
- * Reads a JSON-encoded message (from a "json-message" element) and extracts source descriptions. Adds the extracted
- * source descriptions to the given Jingle IQ in the standard Jingle format.
- *
- * Encoding sources in this compact JSON format instead of standard Jingle was introduced in order to reduce the
- * network traffic and load on the XMPP server. The format is described in Jicofo [TODO: insert link].
- *
- * @param {*} iq the IQ to which source descriptions will be added.
- * @param {*} jsonMessageXml The XML node for the "json-message" element.
- * @returns {Map<string, Array<string>} The audio and video ssrcs extracted from the JSON-encoded message with remote
- * endpoint id as the key.
- */
-function _expandSourcesFromJson(iq, jsonMessageXml) {
-    let json;
-
-    try {
-        json = JSON.parse(jsonMessageXml.textContent);
-    } catch (error) {
-        logger.error(`json-message XML contained invalid JSON, ignoring: ${jsonMessageXml.textContent}`);
-
-        return null;
-    }
-
-    if (!json?.sources) {
-        // It might be a message of a different type, no need to log.
-        return null;
-    }
-
-    // This is where we'll add "source" and "ssrc-group" elements. Create them elements if they don't exist.
-    const audioRtpDescription = _getOrCreateRtpDescription(iq, MediaType.AUDIO);
-    const videoRtpDescription = _getOrCreateRtpDescription(iq, MediaType.VIDEO);
-    const ssrcMap = new Map();
-
-    for (const owner in json.sources) {
-        if (json.sources.hasOwnProperty(owner)) {
-            const ssrcs = [];
-            const ownerSources = json.sources[owner];
-
-            // The video sources, video ssrc-groups, audio sources and audio ssrc-groups are encoded in that order in
-            // the elements of the array.
-            const videoSources = ownerSources?.length && ownerSources[0];
-            const videoSsrcGroups = ownerSources?.length > 1 && ownerSources[1];
-            const audioSources = ownerSources?.length > 2 && ownerSources[2];
-            const audioSsrcGroups = ownerSources?.length > 3 && ownerSources[3];
-
-            if (videoSources?.length) {
-                for (let i = 0; i < videoSources.length; i++) {
-                    videoRtpDescription.appendChild(_createSourceExtension(owner, videoSources[i]));
-                }
-
-                // Log only the first video ssrc per endpoint.
-                ssrcs.push(videoSources[0]?.s);
-            }
-
-            if (videoSsrcGroups?.length) {
-                for (let i = 0; i < videoSsrcGroups.length; i++) {
-                    videoRtpDescription.appendChild(_createSsrcGroupExtension(videoSsrcGroups[i]));
-                }
-            }
-            if (audioSources?.length) {
-                for (let i = 0; i < audioSources.length; i++) {
-                    audioRtpDescription.appendChild(_createSourceExtension(owner, audioSources[i]));
-                }
-                ssrcs.push(audioSources[0]?.s);
-            }
-
-            if (audioSsrcGroups?.length) {
-                for (let i = 0; i < audioSsrcGroups.length; i++) {
-                    audioRtpDescription.appendChild(_createSsrcGroupExtension(audioSsrcGroups[i]));
-                }
-            }
-            ssrcMap.set(owner, ssrcs);
-        }
-    }
-
-    return ssrcMap;
-}
-
-/**
- * Finds in a Jingle IQ the RTP description element with the given media type. If one does not exists, create it (as
- *  well as the required  "content" parent element) and adds it to the IQ.
- * @param {*} iq
- * @param {*} mediaType The media type, "audio" or "video".
- * @returns the RTP description element with the given media type.
- */
-function _getOrCreateRtpDescription(iq, mediaType) {
-    const jingle = $(iq).find('jingle')[0];
-    let content = $(jingle).find(`content[name="${mediaType}"]`);
-    let description;
-
-    if (content.length) {
-        content = content[0];
-    } else {
-        // I'm not suree if "creator" and "senders" are required.
-        content = $build('content', {
-            name: mediaType
-        }).node;
-        jingle.appendChild(content);
-    }
-
-    description = $(content).find('description');
-
-    if (description.length) {
-        description = description[0];
-    } else {
-        description = $build('description', {
-            xmlns: 'urn:xmpp:jingle:apps:rtp:1',
-            media: mediaType
-        }).node;
-        content.appendChild(description);
-    }
-
-    return description;
-}
-
-/**
- * Converts the short string representing SSRC group semantics in compact JSON format to the standard representation
- * (i.e. convert "f" to "FID" and "s" to "SIM").
- * @param {*} str the compact JSON format representation of an SSRC group's semantics.
- * @returns the SSRC group semantics corresponding to [str].
- */
-function _getSemantics(str) {
-    if (str === 'f') {
-        return 'FID';
-    } else if (str === 's') {
-        return 'SIM';
-    }
-
-    return null;
-}
 
 /**
  * Parses the transport XML element and returns the list of ICE candidates formatted as text.
@@ -210,23 +26,66 @@ function _getSemantics(str) {
  * @returns {Array<string>}
  */
 function _parseIceCandidates(transport) {
-    const candidates = $(transport).find('>candidate');
+    const candidates = findAll(transport, ':scope>candidate');
     const parseCandidates = [];
 
     // Extract the candidate information from the IQ.
-    candidates.each((_, candidate) => {
+    candidates.forEach(candidate => {
         const attributes = candidate.attributes;
         const candidateAttrs = [];
 
         for (let i = 0; i < attributes.length; i++) {
             const attr = attributes[i];
 
-            candidateAttrs.push(`${attr.name}: ${attr.value}`);
+            if (!OMITTED_CANDIDATE_ATTRIBUTES.includes(attr.name)) {
+                candidateAttrs.push(`${attr.name}: ${attr.value}`);
+            }
         }
         parseCandidates.push(candidateAttrs.join(' '));
     });
 
     return parseCandidates;
+}
+
+/**
+ * Parse service received over xep-0215 and add it to the list of ice servers.
+ * @param iceservers - the list of ice servers to add the parsed service to.
+ * @param param1
+ * @param param1.type
+ * @param param1.host
+ * @param param1.port
+ * @param param1.username
+ * @param param1.password
+ * @param param1.transport
+ * @private
+ */
+function _parseService(iceservers, { type, host, port, username, password, transport }) {
+    const dict = {};
+
+    switch (type) {
+    case 'stun': {
+        dict.urls = `stun:${host}`;
+        if (port) {
+            dict.urls += `:${port}`;
+        }
+        iceservers.push(dict);
+        break;
+    }
+    case 'turn':
+    case 'turns': {
+        dict.urls = `${type}:${host}`;
+        dict.username = username;
+        if (port) {
+            dict.urls += `:${port}`;
+        }
+        if (transport && transport !== 'udp') {
+            dict.urls += `?transport=${transport}`;
+        }
+        dict.credential = password;
+        iceservers.push(dict);
+        break;
+    }
+    }
 }
 
 /**
@@ -268,14 +127,15 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
      * @param iq
      */
     onJingle(iq) {
-        const sid = $(iq).find('jingle').attr('sid');
-        const action = $(iq).find('jingle').attr('action');
-        const fromJid = iq.getAttribute('from');
+        const jingleElement = findFirst(iq, 'jingle');
+        const sid = getAttribute(jingleElement, 'sid');
+        const action = getAttribute(jingleElement, 'action');
+        const fromJid = getAttribute(iq, 'from');
 
         // send ack first
-        const ack = $iq({ type: 'result',
+        const ack = $iq({ id: iq.getAttribute('id'),
             to: fromJid,
-            id: iq.getAttribute('id')
+            type: 'result'
         });
 
         let sess = this.sessions[sid];
@@ -338,7 +198,7 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
 
         // see http://xmpp.org/extensions/xep-0166.html#concepts-session
 
-        const jsonMessages = $(iq).find('jingle>json-message');
+        const jsonMessages = findAll(iq, 'jingle>json-message');
 
         if (jsonMessages?.length) {
             let audioVideoSsrcs;
@@ -346,7 +206,7 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
             logger.info(`Found a JSON-encoded element in ${action}, translating to standard Jingle.`);
             for (let i = 0; i < jsonMessages.length; i++) {
                 // Currently there is always a single json-message in the IQ with the source information.
-                audioVideoSsrcs = _expandSourcesFromJson(iq, jsonMessages[i]);
+                audioVideoSsrcs = expandSourcesFromJson(iq, jsonMessages[i]);
             }
 
             if (audioVideoSsrcs?.size) {
@@ -364,122 +224,93 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
 
         switch (action) {
         case 'session-initiate': {
-            logger.log('(TIME) received session-initiate:\t', now);
-            const startMuted = $(iq).find('jingle>startmuted');
+            const bridgeSessionId = getAttribute(
+                findFirst(jingleElement, ':scope>bridge-session[*|xmlns="http://jitsi.org/protocol/focus"]'), 'id');
+
+            logger.info(`(TIME) received session-initiate:\t${now}, bridgeSessionId=${bridgeSessionId}`);
 
             isP2P && logger.debug(`Received ${action} from ${fromJid}`);
-            if (startMuted?.length) {
-                const audioMuted = startMuted.attr(MediaType.AUDIO);
-                const videoMuted = startMuted.attr(MediaType.VIDEO);
-
-                this.eventEmitter.emit(
-                    XMPPEvents.START_MUTED_FROM_FOCUS,
-                    audioMuted === 'true',
-                    videoMuted === 'true');
-            }
             const pcConfig = isP2P ? this.p2pIceConfig : this.jvbIceConfig;
 
             sess
                 = new JingleSessionPC(
-                    $(iq).find('jingle').attr('sid'),
-                    $(iq).attr('to'),
+                    sid,
+                    iq.getAttribute('to'),
                     fromJid,
                     this.connection,
                     this.mediaConstraints,
-
-                    // Makes a copy in order to prevent exception thrown on RN when either this.p2pIceConfig or
-                    // this.jvbIceConfig is modified and there's a PeerConnection instance holding a reference
-                    JSON.parse(JSON.stringify(pcConfig)),
+                    cloneDeep(pcConfig),
                     isP2P,
                     /* initiator */ false);
 
             this.sessions[sess.sid] = sess;
-            this.eventEmitter.emit(XMPPEvents.CALL_INCOMING, sess, $(iq).find('>jingle'), now);
+            this.eventEmitter.emit(XMPPEvents.CALL_INCOMING, sess, jingleElement, now);
             break;
         }
         case 'session-accept': {
             const ssrcs = [];
-            const contents = $(iq).find('jingle>content');
 
             // Extract the SSRCs from the session-accept received from a p2p peer.
-            for (const content of contents) {
-                const ssrc = $(content).find('description').attr('ssrc');
+            findAll(iq, 'jingle>content').forEach(content => {
+                const ssrc = getAttribute(findFirst(content, 'description'), 'ssrc');
 
                 ssrc && ssrcs.push(ssrc);
-            }
+            });
+
             logger.debug(`Received ${action} from ${fromJid} with ssrcs=${ssrcs}`);
-            this.eventEmitter.emit(XMPPEvents.CALL_ACCEPTED, sess, $(iq).find('>jingle'));
+            this.eventEmitter.emit(XMPPEvents.CALL_ACCEPTED, sess, jingleElement);
             break;
         }
         case 'content-modify': {
-            const height = $(iq).find('jingle>content[name="video"]>max-frame-height');
-
-            logger.debug(`Received ${action} from ${fromJid} with a max-frame-height=${height?.text()}`);
-            sess.modifyContents($(iq).find('>jingle'));
+            logger.debug(`Received ${action} from ${fromJid}`);
+            sess.modifyContents(jingleElement);
             break;
         }
         case 'transport-info': {
-            const candidates = _parseIceCandidates($(iq).find('jingle>content>transport'));
+            const transportElement = findFirst(iq, 'jingle>content>transport');
+            const candidates = _parseIceCandidates(transportElement);
 
             logger.debug(`Received ${action} from ${fromJid} for candidates=${candidates.join(', ')}`);
-            this.eventEmitter.emit(XMPPEvents.TRANSPORT_INFO, sess, $(iq).find('>jingle'));
+
+            // A transport tagged with an ice-generation is the transport of a new ICE agent that the bridge
+            // created in response to an in-place ICE restart request. It replaces the remote ICE credentials
+            // and its candidates have to be added only after the offer/answer completes, so it is applied as a
+            // single atomic operation instead of going through the generic candidate handling.
+            if (transportElement?.getAttribute('ice-generation')) {
+                sess.onBridgeIceRestartTransport(transportElement);
+                break;
+            }
+
+            this.eventEmitter.emit(XMPPEvents.TRANSPORT_INFO, sess, jingleElement);
             break;
         }
         case 'session-terminate': {
-            logger.log('terminating...', sess.sid);
+            logger.info('terminating...', sess.sid);
             let reasonCondition = null;
             let reasonText = null;
 
-            if ($(iq).find('>jingle>reason').length) {
-                reasonCondition
-                    = $(iq).find('>jingle>reason>:first')[0].tagName;
-                reasonText = $(iq).find('>jingle>reason>text').text();
+            const reasonElement = findFirst(iq, ':scope>jingle>reason');
+
+            if (reasonElement) {
+                const firstReasonChild = reasonElement.children?.length > 0 ? reasonElement.children[0] : undefined;
+
+                reasonCondition = firstReasonChild ? firstReasonChild.tagName : null;
+                reasonText = getText(findFirst(iq, ':scope>jingle>reason>text'));
             }
+
             logger.debug(`Received ${action} from ${fromJid} disconnect reason=${reasonText}`);
             this.terminate(sess.sid, reasonCondition, reasonText);
             this.eventEmitter.emit(XMPPEvents.CALL_ENDED, sess, reasonCondition, reasonText);
             break;
         }
-        case 'transport-replace': {
-            logger.info('(TIME) Start transport replace:\t', now);
-            const transport = $(iq).find('jingle>content>transport');
-            const candidates = _parseIceCandidates(transport);
-            const iceUfrag = $(transport).attr('ufrag');
-            const icePwd = $(transport).attr('pwd');
-            const dtlsFingerprint = $(transport).find('>fingerprint')?.text();
-
-            logger.debug(`Received ${action} from ${fromJid} with iceUfrag=${iceUfrag},`
-            + ` icePwd=${icePwd}, DTLS fingerprint=${dtlsFingerprint}, candidates=${candidates.join(', ')}`);
-
-            Statistics.sendAnalytics(createJingleEvent(
-                ACTION_JINGLE_TR_RECEIVED,
-                {
-                    p2p: isP2P,
-                    value: now
-                }));
-
-            sess.replaceTransport($(iq).find('>jingle'), () => {
-                const successTime = window.performance.now();
-
-                logger.info('(TIME) Transport replace success:\t', successTime);
-                Statistics.sendAnalytics(createJingleEvent(
-                    ACTION_JINGLE_TR_SUCCESS,
-                    {
-                        p2p: isP2P,
-                        value: successTime
-                    }));
-            }, error => {
-                GlobalOnErrorHandler.callErrorHandler(error);
-                logger.error('Transport replace failed', error);
-                sess.sendTransportReject();
-            });
+        case 'transport-replace':
+            logger.error(`Ignoring ${action} from ${fromJid} as it is not supported by the client.`);
             break;
-        }
         case 'source-add':
-            sess.addRemoteStream($(iq).find('>jingle>content'));
+            sess.addRemoteStream(findAll(iq, ':scope>jingle>content'));
             break;
         case 'source-remove':
-            sess.removeRemoteStream($(iq).find('>jingle>content'));
+            sess.removeRemoteStream(findAll(iq, ':scope>jingle>content'));
             break;
         default:
             logger.warn('jingle action not implemented', action);
@@ -525,7 +356,7 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
      * @param reasonCondition
      * @param reasonText
      */
-    terminate(sid, reasonCondition, reasonText) {
+    terminate(sid, reasonCondition = undefined, reasonText = undefined) {
         if (this.sessions.hasOwnProperty(sid)) {
             if (this.sessions[sid].state !== 'ended') {
                 this.sessions[sid].onTerminated(reasonCondition, reasonText);
@@ -552,19 +383,31 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
         // TODO: implement refresh via updateIce as described in
         //      https://code.google.com/p/webrtc/issues/detail?id=1650
         this.connection.sendIQ(
-            $iq({ type: 'get',
-                to: this.xmpp.options.hosts.domain })
+            $iq({ to: this.xmpp.options.hosts.domain,
+                type: 'get' })
                 .c('services', { xmlns: 'urn:xmpp:extdisco:2' }),
             v2Res => this.onReceiveStunAndTurnCredentials(v2Res),
-            v2Err => {
-                logger.warn('getting turn credentials with extdisco:2 failed, trying extdisco:1', v2Err);
+            error => {
+                handleStropheError(error, {
+                    domain: this.xmpp.options.hosts.domain,
+                    operation: 'get STUN/TURN credentials (extdisco:2)',
+                    userJid: this.connection.jid,
+                    xmlns: 'urn:xmpp:extdisco:2'
+                });
+                logger.warn('getting turn credentials with extdisco:2 failed, trying extdisco:1');
                 this.connection.sendIQ(
-                    $iq({ type: 'get',
-                        to: this.xmpp.options.hosts.domain })
+                    $iq({ to: this.xmpp.options.hosts.domain,
+                        type: 'get' })
                         .c('services', { xmlns: 'urn:xmpp:extdisco:1' }),
                     v1Res => this.onReceiveStunAndTurnCredentials(v1Res),
-                    v1Err => {
-                        logger.warn('getting turn credentials failed', v1Err);
+                    err => {
+                        handleStropheError(err, {
+                            domain: this.xmpp.options.hosts.domain,
+                            operation: 'get STUN/TURN credentials (extdisco:1)',
+                            userJid: this.connection.jid,
+                            xmlns: 'urn:xmpp:extdisco:1'
+                        });
+                        logger.warn('getting turn credentials failed');
                         logger.warn('is mod_turncredentials or similar installed and configured?');
                     }
                 );
@@ -578,47 +421,62 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
      * @return {boolean} Whether something was processed from the supplied message.
      */
     onReceiveStunAndTurnCredentials(res) {
-        const iceservers = [];
+        let iceservers = [];
 
-        $(res).find('>services>service').each((idx, el) => {
-            // eslint-disable-next-line no-param-reassign
-            el = $(el);
-            const dict = {};
-            const type = el.attr('type');
-
-            switch (type) {
-            case 'stun':
-                dict.urls = `stun:${el.attr('host')}`;
-                if (el.attr('port')) {
-                    dict.urls += `:${el.attr('port')}`;
-                }
-                iceservers.push(dict);
-                break;
-            case 'turn':
-            case 'turns': {
-                dict.urls = `${type}:`;
-                dict.username = el.attr('username');
-                dict.urls += el.attr('host');
-                const port = el.attr('port');
-
-                if (port) {
-                    dict.urls += `:${el.attr('port')}`;
-                }
-                const transport = el.attr('transport');
-
-                if (transport && transport !== 'udp') {
-                    dict.urls += `?transport=${transport}`;
-                }
-
-                dict.credential = el.attr('password')
-                        || dict.credential;
-                iceservers.push(dict);
-                break;
-            }
-            }
-        });
+        if (Array.isArray(res?.services)) {
+            res.services.forEach(s => _parseService(iceservers, s));
+        } else {
+            findAll(res, ':scope>services>service').forEach(el => _parseService(iceservers, {
+                host: getAttribute(el, 'host'),
+                password: getAttribute(el, 'password'),
+                port: getAttribute(el, 'port'),
+                transport: getAttribute(el, 'transport'),
+                type: getAttribute(el, 'type'),
+                username: getAttribute(el, 'username')
+            }));
+        }
 
         const options = this.xmpp.options;
+        const { iceServersOverride = [] } = options;
+
+        iceServersOverride.forEach(({ targetType, urls, username, credential }) => {
+            if (![ 'turn', 'turns', 'stun' ].includes(targetType)) {
+                return;
+            }
+
+            const pattern = `${targetType}:`;
+
+            if (typeof urls === 'undefined'
+                && typeof username === 'undefined'
+                && typeof credential === 'undefined') {
+                return;
+            }
+
+            if (urls === null) { // remove this type of ice server
+                iceservers = iceservers.filter(server => !server.urls.startsWith(pattern));
+            }
+
+
+            iceservers.forEach(server => {
+                if (!server.urls.startsWith(pattern)) {
+                    return;
+                }
+
+                server.urls = urls ?? server.urls;
+
+                if (username === null) {
+                    delete server.username;
+                } else {
+                    server.username = username ?? server.username;
+                }
+
+                if (credential === null) {
+                    delete server.credential;
+                } else {
+                    server.credential = credential ?? server.credential;
+                }
+            });
+        });
 
         // Shuffle ICEServers for loadbalancing
         for (let i = iceservers.length - 1; i > 0; i--) {
@@ -646,6 +504,7 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
 
     /**
      * Returns the data saved in 'updateLog' in a format to be logged.
+     * @returns {Record<string, unknown>} An object containing the data to be logged.
      */
     getLog() {
         const data = {};
@@ -657,8 +516,8 @@ export default class JingleConnectionPlugin extends ConnectionPlugin {
             if (pc && pc.updateLog) {
                 // FIXME: should probably be a .dump call
                 data[`jingle_${sid}`] = {
-                    updateLog: pc.updateLog,
                     stats: pc.stats,
+                    updateLog: pc.updateLog,
                     url: window.location.href
                 };
             }

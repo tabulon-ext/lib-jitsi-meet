@@ -1,0 +1,1317 @@
+import JitsiConference from '../../JitsiConference';
+import JitsiConferenceEventManager from '../../JitsiConferenceEventManager';
+import { JitsiTrackEvents } from '../../JitsiTrackEvents';
+import JitsiRemoteTrack from '../RTC/JitsiRemoteTrack';
+import { MockRTC } from '../RTC/MockClasses';
+import SDP from '../sdp/SDP';
+import EventEmitter from '../util/EventEmitter';
+import Statistics from '../statistics/statistics';
+import { nextTick } from '../util/TestUtils';
+import { parseXML, findAll, findFirst } from '../util/XMLUtils';
+import { IceRestartReason } from '../../service/RTC/IceRestartReason';
+import { MediaType } from '../../service/RTC/MediaType';
+import { RTCEvents } from '../../service/RTC/RTCEvents';
+import { VideoType } from '../../service/RTC/VideoType';
+import { MediaConnectivityReason, MediaConnectivityStatus } from '../../service/connectivity/MediaConnectivity';
+import { AnalyticsEvents } from '../../service/statistics/AnalyticsEvents';
+import { XMPPEvents } from '../../service/xmpp/XMPPEvents';
+import FeatureFlags from '../flags/FeatureFlags';
+
+import JingleSessionPC from './JingleSessionPC';
+import {JingleSessionState} from './JingleSessionState';
+import { MediaSessionEvents } from './MediaSessionEvents';
+import { MockChatRoom, MockStropheConnection } from './MockClasses';
+import SignalingLayerImpl from './SignalingLayerImpl';
+
+/**
+ * Creates 'content-modify' Jingle IQ.
+ * @returns {Object}
+ */
+function createContentModifyForSourceNames() {
+    return parseXML(
+        '<jingle action="content-modify" initiator="peer2" sid="sid12345" xmlns="urn:xmpp:jingle:1">'
+        + '<content name="video" senders="both">'
+        + '<source-frame-height maxHeight="180" sourceName="8d519815-v0" xmlns="http://jitsi.org/jitmeet/video"/>'
+        + '<source-frame-height maxHeight="2160" sourceName="8d519815-v1" xmlns="http://jitsi.org/jitmeet/video"/>'
+        + '</content>'
+        + '</jingle>');
+}
+
+describe('JingleSessionPC', () => {
+    let jingleSession: JingleSessionPC;
+    let connection: MockStropheConnection;
+    let rtc;
+    const offerIQ = {
+        querySelector: () => null,
+        querySelectorAll: () => []
+    };
+
+    const SID = 'sid12345';
+
+    beforeEach(() => {
+        connection = new MockStropheConnection();
+        jingleSession = new JingleSessionPC(
+            SID,
+            'peer1',
+            'peer2',
+            connection,
+            { },
+            { },
+            true,
+            false);
+
+        rtc = new MockRTC();
+
+        jingleSession.initialize(
+            /* ChatRoom */ new MockChatRoom(),
+            /* RTC */ rtc,
+            /* Signaling layer */ {
+                setSSRCOwner: () => { }, // eslint-disable-line no-empty-function,
+                removeSSRCOwners: () => { } // eslint-disable-line no-empty-function
+            },
+            /* options */ { });
+
+        // eslint-disable-next-line no-empty-function
+        // connection.connect('jid', undefined, () => { }); */
+    });
+
+    describe('send/receive video constraints w/ source-name', () => {
+        it('sends content-modify with recv frame size', () => {
+            const sendIQSpy = spyOn(connection, 'sendIQ').and.callThrough();
+            const sourceConstraints = new Map();
+
+            sourceConstraints.set('8d519815-v0', 180);
+            sourceConstraints.set('8d519815-v1', 2160);
+
+            jingleSession.setReceiverVideoConstraint(sourceConstraints);
+
+            expect(jingleSession.getState()).toBe(JingleSessionState.PENDING);
+
+            return new Promise((resolve, reject) => {
+                jingleSession.acceptOffer(
+                    offerIQ,
+                    resolve,
+                    reject,
+                    /* local tracks */ []);
+            }).then(() => {
+                expect(jingleSession.getState()).toBe(JingleSessionState.ACTIVE);
+
+                // FIXME content-modify is sent before session-accept
+                expect(sendIQSpy.calls.count()).toBe(2);
+
+                expect((sendIQSpy.calls.first().args[0] as any).toString()).toBe(
+                    '<iq to="peer2" type="set" xmlns="jabber:client">'
+                    + '<jingle action="content-modify" initiator="peer2" sid="sid12345" xmlns="urn:xmpp:jingle:1">'
+                    + '<content name="video" senders="both">'
+                    + '<source-frame-height maxHeight="180" sourceName="8d519815-v0"'
+                    + ' xmlns="http://jitsi.org/jitmeet/video"/>'
+                    + '<source-frame-height maxHeight="2160" sourceName="8d519815-v1"'
+                    + ' xmlns="http://jitsi.org/jitmeet/video"/>'
+                    + '</content>'
+                    + '</jingle>'
+                    + '</iq>');
+            });
+        });
+        it('does not send content-modify again for unchanged recv frame sizes', () => {
+            const sendIQSpy = spyOn(connection, 'sendIQ').and.callThrough();
+            const constraints = (v1Height: number) => new Map([ [ '8d519815-v0', 180 ], [ '8d519815-v1', v1Height ] ]);
+
+            return new Promise((resolve, reject) => {
+                jingleSession.acceptOffer(
+                    offerIQ,
+                    resolve,
+                    reject,
+                    /* local tracks */ []);
+            }).then(() => {
+                expect(jingleSession.getState()).toBe(JingleSessionState.ACTIVE);
+                sendIQSpy.calls.reset();
+
+                jingleSession.setReceiverVideoConstraint(constraints(2160));
+                jingleSession.setReceiverVideoConstraint(constraints(2160));
+                jingleSession.setReceiverVideoConstraint(constraints(2160));
+                expect(sendIQSpy.calls.count()).toBe(1);
+
+                jingleSession.setReceiverVideoConstraint(constraints(-1));
+                expect(sendIQSpy.calls.count()).toBe(2);
+                expect((sendIQSpy.calls.mostRecent().args[0] as any).toString()).toContain(
+                    '<source-frame-height maxHeight="-1" sourceName="8d519815-v1"');
+            });
+        });
+        it('fires an event when remote peer sends content-modify', () => {
+            let remoteSourcesRecvMaxFrameHeight;
+            const remoteVideoConstraintsListener = () => {
+                console.error('asdasdasd', jingleSession.getRemoteSourcesRecvMaxFrameHeight());
+                remoteSourcesRecvMaxFrameHeight = jingleSession.getRemoteSourcesRecvMaxFrameHeight();
+            };
+
+            jingleSession.addListener(
+                MediaSessionEvents.REMOTE_SOURCE_CONSTRAINTS_CHANGED,
+                remoteVideoConstraintsListener);
+
+            return new Promise((resolve, reject) => {
+                jingleSession.acceptOffer(
+                    offerIQ,
+                    resolve,
+                    reject,
+                    /* local tracks */ []);
+            }).then(() => {
+                jingleSession.modifyContents(createContentModifyForSourceNames());
+
+                console.error('BBBBBB ', remoteSourcesRecvMaxFrameHeight);
+                const v0Height = remoteSourcesRecvMaxFrameHeight[0].maxHeight;
+                const v1Height = remoteSourcesRecvMaxFrameHeight[1].maxHeight;
+
+                expect(v0Height).toBe('180');
+                expect(v1Height).toBe('2160');
+            });
+        });
+    });
+
+    describe('_processSourceAddOrRemove', () => {
+        let peerconnection, removeSsrcOwnersSpy, setSsrcOwnerSpy, sourceInfo, updateRemoteSourcesSpy;
+
+        beforeEach(() => {
+            peerconnection = jingleSession.peerconnection;
+            setSsrcOwnerSpy = spyOn(jingleSession._signalingLayer, 'setSSRCOwner');
+            removeSsrcOwnersSpy = spyOn(jingleSession._signalingLayer, 'removeSSRCOwners');
+            updateRemoteSourcesSpy = spyOn(peerconnection, 'updateRemoteSources');
+        });
+        it('should handle no sources', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'/>
+                        </content>
+                        <content name='video'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='video'/>
+                        </content>
+                    </jingle>`
+            );
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>jingle>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+
+            expect(sourceInfo.size).toBe(0);
+            expect(setSsrcOwnerSpy).not.toHaveBeenCalled();
+            expect(removeSsrcOwnersSpy).not.toHaveBeenCalled();
+            expect(updateRemoteSourcesSpy).not.toHaveBeenCalled();
+        });
+
+        it('should handle a single source', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            expect(jingle).not.toBe(null);
+
+            if (!jingle) {
+                return;
+            }
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+            expect(sourceInfo.size).toBe(1);
+            expect(sourceInfo.get('source1').ssrcList).toEqual([ '1234' ]);
+            expect(sourceInfo.get('source1').msid).toBe('stream1');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(1234, null, 'source1');
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, true);
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, false);
+
+            expect(removeSsrcOwnersSpy).toHaveBeenCalledWith([ 1234 ]);
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, false);
+        });
+
+        it('should parse the mid parameter when present', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                    <parameter name='mid' value='a0'/>
+                                </source>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            expect(jingle).not.toBe(null);
+
+            if (!jingle) {
+                return;
+            }
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+            expect(sourceInfo.size).toBe(1);
+            expect(sourceInfo.get('source1').mid).toBe('a0');
+        });
+
+        it('leaves mid null when no mid parameter is present', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            expect(jingle).not.toBe(null);
+
+            if (!jingle) {
+                return;
+            }
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+            expect(sourceInfo.get('source1').mid).toBeNull();
+        });
+
+        it('should handle multiple ssrcs belonging to the same source', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                                <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'/>
+                        </content>
+                        <content name='video'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='video'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <ssrc-group xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' semantics='FID'>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234'/>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678'/>
+                                </ssrc-group>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            expect(jingle).not.toBe(null);
+
+            if (!jingle) {
+                return;
+            }
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+
+            expect(sourceInfo.size).toBe(1);
+            expect(sourceInfo.get('source1').ssrcList).toEqual([ '1234', '5678' ]);
+            expect(sourceInfo.get('source1').msid).toBe('stream1');
+            expect(sourceInfo.get('source1').mediaType).toBe('video');
+            expect(sourceInfo.get('source1').groups).toEqual([ {
+                semantics: 'FID',
+                ssrcs: [ '1234', '5678' ] } ]);
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(1234, null, 'source1');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(5678, null, 'source1');
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, true);
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, false);
+
+            expect(removeSsrcOwnersSpy).toHaveBeenCalledWith([ 1234, 5678 ]);
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, false);
+        });
+
+        it('should handle multiple ssrcs belonging to different sources', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='audio'>
+                                <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'/>
+                        </content>
+                        <content name='video'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='video'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='4321' name='source2' owner='peer'>
+                                    <parameter name='msid' value='stream2'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='8765' name='source2' owner='peer'>
+                                    <parameter name='msid' value='stream2'/>
+                                </source>
+                                <ssrc-group xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' semantics='FID'>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234'/>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678'/>
+                                </ssrc-group>
+                                <ssrc-group xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' semantics='FID'>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='4321'/>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='8765'/>
+                                </ssrc-group>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            expect(jingle).not.toBe(null);
+
+            if (!jingle) {
+                return;
+            }
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+
+            expect(sourceInfo.size).toBe(2);
+            expect(sourceInfo.get('source1').ssrcList).toEqual([ '1234', '5678' ]);
+            expect(sourceInfo.get('source1').msid).toBe('stream1');
+            expect(sourceInfo.get('source1').groups).toEqual([ {
+                semantics: 'FID',
+                ssrcs: [ '1234', '5678' ] } ]);
+            expect(sourceInfo.get('source1').mediaType).toBe('video');
+            expect(sourceInfo.get('source2').ssrcList).toEqual([ '4321', '8765' ]);
+            expect(sourceInfo.get('source2').msid).toBe('stream2');
+            expect(sourceInfo.get('source2').groups).toEqual([ {
+                semantics: 'FID',
+                ssrcs: [ '4321', '8765' ] } ]);
+            expect(sourceInfo.get('source2').mediaType).toBe('video');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(1234, null, 'source1');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(5678, null, 'source1');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(4321, null, 'source2');
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(8765, null, 'source2');
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, true);
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, false);
+
+            expect(removeSsrcOwnersSpy).toHaveBeenCalledWith([ 1234, 5678, 4321, 8765 ]);
+            expect(updateRemoteSourcesSpy).toHaveBeenCalledWith(sourceInfo, false);
+        });
+
+        it('ignores a source whose ssrc is not a valid 32-bit decimal integer', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='video'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='video'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='(.+)+$' name='evil' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='99999999999999999999' name='big' owner='peer'>
+                                    <parameter name='msid' value='stream2'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='ok' owner='peer'>
+                                    <parameter name='msid' value='stream3'/>
+                                </source>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+
+            expect(sourceInfo.has('evil')).toBe(false);
+            expect(sourceInfo.has('big')).toBe(false);
+            expect(sourceInfo.get('ok').ssrcList).toEqual([ '1234' ]);
+            expect(setSsrcOwnerSpy).toHaveBeenCalledWith(1234, null, 'ok');
+            expect(setSsrcOwnerSpy).not.toHaveBeenCalledWith(NaN, jasmine.anything(), 'evil');
+        });
+
+        it('ignores an ssrc-group whose semantics is not a known value', () => {
+            const jingle = parseXML(
+                    `<jingle xmlns='urn:xmpp:jingle:1'>
+                        <content name='video'>
+                            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='video'>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678' name='source1' owner='peer'>
+                                    <parameter name='msid' value='stream1'/>
+                                </source>
+                                <ssrc-group xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' semantics='(.+)+$'>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='1234'/>
+                                    <source xmlns='urn:xmpp:jingle:apps:rtp:ssma:0' ssrc='5678'/>
+                                </ssrc-group>
+                            </description>
+                        </content>
+                    </jingle>`
+            );
+
+            const sourceAddElem = findAll(jingle.documentElement, ':scope>content');
+
+            sourceInfo = jingleSession._processSourceMapFromJingle(sourceAddElem, true);
+
+            expect(sourceInfo.get('source1').groups).toEqual([]);
+        });
+    });
+
+    describe('_recoverWedgedAudioSource', () => {
+        let addOrRemoveSpy, peerconnection, pushSpy;
+
+        /**
+         * Builds a minimal mock of a remote audio track.
+         *
+         * @param {number} ssrc - The track SSRC.
+         * @param {string} source - The source name.
+         * @param {string} owner - The owner endpoint id.
+         * @returns {object}
+         */
+        function mockTrack(ssrc: number, source: string, owner = 'owner-A'): any {
+            return {
+                getParticipantId: () => owner,
+                getSourceName: () => source,
+                getSsrc: () => ssrc
+            };
+        }
+
+        /**
+         * Runs the recovery task that was queued on the modification queue.
+         *
+         * @returns {void}
+         */
+        function runQueuedTask(): void {
+            const workFunction = pushSpy.calls.mostRecent().args[0];
+
+            workFunction(() => { }); // eslint-disable-line no-empty-function
+        }
+
+        beforeEach(() => {
+            peerconnection = jingleSession.peerconnection;
+            addOrRemoveSpy = spyOn(jingleSession as any, '_addOrRemoveRemoteStream');
+            spyOn(Statistics, 'sendAnalytics');
+
+            // Capture (do not run) the queued recovery task so it can be invoked deterministically.
+            pushSpy = spyOn(jingleSession.modificationQueue, 'push');
+        });
+
+        it('recycles the source via source-remove then source-add when the slot is unchanged', () => {
+            spyOn(peerconnection, 'getTrackBySSRC').and.returnValue(mockTrack(111, 'source-A'));
+
+            (jingleSession as any)._recoverWedgedAudioSource(mockTrack(111, 'source-A'));
+            runQueuedTask();
+
+            expect(addOrRemoveSpy).toHaveBeenCalledTimes(2);
+            expect(addOrRemoveSpy.calls.argsFor(0)[0]).toBe(false); // source-remove first
+            expect(addOrRemoveSpy.calls.argsFor(1)[0]).toBe(true); // source-add second
+            expect(Statistics.sendAnalytics).toHaveBeenCalled();
+        });
+
+        it('skips recovery when the slot was remapped to a different source', () => {
+            // The SSRC now belongs to a different source (a remap landed between detection and execution).
+            spyOn(peerconnection, 'getTrackBySSRC').and.returnValue(mockTrack(111, 'source-B'));
+
+            (jingleSession as any)._recoverWedgedAudioSource(mockTrack(111, 'source-A'));
+            runQueuedTask();
+
+            expect(addOrRemoveSpy).not.toHaveBeenCalled();
+            expect(Statistics.sendAnalytics).not.toHaveBeenCalled();
+        });
+
+        it('skips recovery when the slot was removed', () => {
+            spyOn(peerconnection, 'getTrackBySSRC').and.returnValue(null);
+
+            (jingleSession as any)._recoverWedgedAudioSource(mockTrack(111, 'source-A'));
+            runQueuedTask();
+
+            expect(addOrRemoveSpy).not.toHaveBeenCalled();
+            expect(Statistics.sendAnalytics).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('setMediaTransferActive', () => {
+        let calls: boolean[];
+        let pc;
+        let resolvers: (() => void)[];
+
+        beforeEach(() => {
+            calls = [];
+            resolvers = [];
+            pc = {
+                audioTransferActive: true,
+                configureAudioSenderEncodings: () => Promise.resolve(),
+                configureVideoSenderEncodings: () => Promise.resolve(),
+                setMediaTransferActive: (active: boolean) => {
+                    calls.push(active);
+
+                    return new Promise<void>(resolve => resolvers.push(resolve));
+                },
+                videoTransferActive: true
+            };
+            (jingleSession as any).peerconnection = pc;
+        });
+
+        it('does nothing when the transfer state is already the one asked for', async () => {
+            await jingleSession.setMediaTransferActive(true);
+
+            expect(calls).toEqual([]);
+        });
+
+        // The recorded state is written up front, so a change that did not take has to be put back or the retry
+        // would be mistaken for a no-op and the senders would stay where they were.
+        it('leaves a failed change retryable', async () => {
+            pc.setMediaTransferActive = (active: boolean) => {
+                calls.push(active);
+
+                return Promise.reject(new Error('setParameters failed'));
+            };
+
+            await expectAsync(jingleSession.setMediaTransferActive(false)).toBeRejected();
+
+            expect(pc.audioTransferActive).toBe(true);
+            expect(pc.videoTransferActive).toBe(true);
+
+            await expectAsync(jingleSession.setMediaTransferActive(false)).toBeRejected();
+
+            // The second attempt reached the peer connection rather than short-circuiting.
+            expect(calls).toEqual([ false, false ]);
+        });
+
+        // A p2p session abandoned right after it comes up suspends and resumes the jvb milliseconds apart.
+        it('does not swallow a resume that arrives while a suspend is still in flight', async () => {
+            const suspend = jingleSession.setMediaTransferActive(false);
+            const resume = jingleSession.setMediaTransferActive(true);
+
+            expect(calls).toEqual([ false, true ]);
+
+            resolvers.forEach(resolve => resolve());
+            await Promise.allSettled([ suspend, resume ]);
+
+            expect(pc.audioTransferActive).toBe(true);
+            expect(pc.videoTransferActive).toBe(true);
+        });
+    });
+
+    describe('synthetic source kinds', () => {
+        let session: any;
+        let signalingLayer: SignalingLayerImpl;
+
+        beforeEach(() => {
+            // Only the source-map bookkeeping is exercised: no remote track exists yet, so every mapped SSRC is
+            // skipped right after its kind is recorded.
+            spyOn(FeatureFlags, 'isSsrcRewritingSupported').and.returnValue(true);
+            signalingLayer = new SignalingLayerImpl();
+            session = Object.create(JingleSessionPC.prototype);
+            session._signalingLayer = signalingLayer;
+            session.isP2P = false;
+            session.options = {};
+            session.peerconnection = {
+                addRemoteSsrc: () => false,
+                close: () => { /* no-op */ },
+                getTrackBySSRC: () => null
+            };
+            session.modificationQueue = {
+                clear: () => { /* no-op */ },
+                push: (task: (done: () => void) => void) => task(() => { /* no-op */ }),
+                shutdown: () => { /* no-op */ }
+            };
+            session._iceRestartStatsTimer = null;
+        });
+
+        it('processSourceMap records the kind the bridge signals for each audio source', () => {
+            session.processSourceMap({
+                mappedSources: [
+                    { kind: 'agent', owner: 'agent-0dae1739', rtx: '-1', source: 'agent-0dae1739-a0', ssrc: 1111 },
+                    { kind: 'translation', owner: 'abcdef12', rtx: '-1', source: 'abcdef12-a0.en', ssrc: 2222 },
+                    { kind: 'bogus', owner: 'abcdef12', rtx: '-1', source: 'abcdef12-a0.de', ssrc: 3333 },
+                    { owner: 'abcdef12', rtx: '-1', source: 'abcdef12-a0', ssrc: 4444 }
+                ]
+            }, MediaType.AUDIO);
+
+            expect(signalingLayer.getSyntheticSourceKind('agent-0dae1739-a0')).toBe('agent');
+            expect(signalingLayer.getSyntheticSourceKind('abcdef12-a0.en')).toBe('translation');
+            expect(signalingLayer.getSyntheticSourceKind('abcdef12-a0.de')).toBeUndefined();
+            expect(signalingLayer.getSyntheticSourceKind('abcdef12-a0')).toBeUndefined();
+        });
+
+        describe('an existing SSRC re-mapped to another source', () => {
+            let muteChanges: Array<[ string, boolean ]>;
+            let owners: string[];
+            let ownerSetSource: string;
+            const track = {
+                getParticipantId: () => 'abcdef12',
+                getSourceName: () => 'abcdef12-a0',
+                setMute: (muted: boolean) => muteChanges.push([ ownerSetSource, muted ])
+            };
+
+            beforeEach(() => {
+                muteChanges = [];
+                owners = [];
+                session.peerconnection = {
+                    addRemoteSsrc: () => false,
+                    close: () => { /* no-op */ },
+                    getRemoteSourceInfoBySourceName: () => undefined,
+                    getTrackBySSRC: () => track
+                };
+                session.room = {
+                    eventEmitter: {
+                        emit: (_event: string, _track: typeof track, owner: string, source: string) => {
+                            owners.push(owner);
+                            ownerSetSource = source;
+                        }
+                    }
+                };
+            });
+
+            it('takes an agent source, which has no presence, unmuted and goes on with the message', () => {
+                session.processSourceMap({
+                    mappedSources: [
+                        { kind: 'agent', owner: 'agent-0dae1739', rtx: '-1', source: 'agent-0dae1739-a0', ssrc: 1111 },
+                        { owner: 'bbbbbbbb', rtx: '-1', source: 'bbbbbbbb-a0', ssrc: 2222 }
+                    ]
+                }, MediaType.AUDIO);
+
+                expect(muteChanges).toEqual([ [ 'agent-0dae1739-a0', false ] ]);
+                expect(owners).toEqual([ 'agent-0dae1739', 'bbbbbbbb' ]);
+            });
+
+            it('takes a translated source unmuted, whatever its owner\'s presence says', () => {
+                const presence = spyOn(signalingLayer, 'getPeerMediaInfo').and.returnValue({ muted: true });
+
+                session.processSourceMap({
+                    mappedSources: [
+                        { kind: 'translation', owner: 'abcdef12', rtx: '-1', source: 'abcdef12-a0.en', ssrc: 1111 }
+                    ]
+                }, MediaType.AUDIO);
+
+                expect(muteChanges).toEqual([ [ 'abcdef12-a0.en', false ] ]);
+                expect(presence).not.toHaveBeenCalled();
+            });
+
+            it('still takes a regular source\'s mute state from presence', () => {
+                spyOn(signalingLayer, 'getPeerMediaInfo').and.returnValue({ muted: true });
+
+                session.processSourceMap({
+                    mappedSources: [ { owner: 'bbbbbbbb', rtx: '-1', source: 'bbbbbbbb-a0', ssrc: 1111 } ]
+                }, MediaType.AUDIO);
+
+                expect(muteChanges).toEqual([ [ 'bbbbbbbb-a0', true ] ]);
+            });
+        });
+
+        it('close() forgets the kinds signaled on a JVB session', () => {
+            signalingLayer.setSyntheticSourceKind('agent-0dae1739-a0', 'agent');
+
+            session.close();
+
+            expect(signalingLayer.getSyntheticSourceKind('agent-0dae1739-a0')).toBeUndefined();
+        });
+
+        it('close() of a P2P session leaves the kinds signaled by the bridge alone', () => {
+            session.isP2P = true;
+            signalingLayer.setSyntheticSourceKind('agent-0dae1739-a0', 'agent');
+
+            session.close();
+
+            expect(signalingLayer.getSyntheticSourceKind('agent-0dae1739-a0')).toBe('agent');
+        });
+    });
+});
+
+describe('processSourceMap - mute state of a re-mapped SSRC', () => {
+    let session: JingleSessionPC;
+    let signalingLayer: SignalingLayerImpl;
+    let conference: JitsiConference;
+
+    function audioTrack(owner: string, sourceName: string, ssrc: number, muted: boolean): JitsiRemoteTrack {
+        return new JitsiRemoteTrack(
+            null, conference, owner, new MediaStream(),
+            jasmine.createSpyObj<MediaStreamTrack>('mediaTrack', [ 'addEventListener' ]),
+            MediaType.AUDIO, undefined, ssrc, muted, false, sourceName);
+    }
+
+    function useTracks(tracks: JitsiRemoteTrack[]): void {
+        Object.assign(session, {
+            peerconnection: {
+                _sourceMutedChanged: () => fail('the re-mapped track is known, no lookup by source name is needed'),
+                addRemoteSsrc: () => false,
+                getRemoteSourceInfoBySourceName: () => undefined,
+                getRemoteTracks: () => tracks,
+                getTrackBySSRC: (ssrc: number) => tracks.find(t => t.getSsrc() === ssrc)
+            }
+        });
+    }
+
+    beforeEach(() => {
+        const room = new EventEmitter();
+
+        spyOn(FeatureFlags, 'isSsrcRewritingSupported').and.returnValue(true);
+        signalingLayer = new SignalingLayerImpl();
+        const chatRoom = {
+            addListener: room.addListener.bind(room),
+            eventEmitter: room,
+            setParticipantPropertyListener: () => { /* no-op */ }
+        };
+
+        // The real prototypes with only the members processSourceMap and the TRACK_OWNER_SET handler use.
+        session = Object.assign(Object.create(JingleSessionPC.prototype), {
+            _signalingLayer: signalingLayer,
+            isP2P: false,
+            options: {},
+            room: chatRoom
+        });
+        conference = Object.assign(Object.create(JitsiConference.prototype), {
+            _remoteTrackRelays: new WeakMap(),
+            _signalingLayer: signalingLayer,
+            eventEmitter: new EventEmitter(),
+            getActivePeerConnection: () => undefined,
+            room: chatRoom
+        });
+        new JitsiConferenceEventManager(conference).setupChatRoomListeners();
+    });
+
+    [
+        { mediaType: MediaType.AUDIO, muted: false },
+        { mediaType: MediaType.AUDIO, muted: true },
+        { mediaType: MediaType.VIDEO, muted: false },
+        { mediaType: MediaType.VIDEO, muted: true }
+    ].forEach(({ mediaType, muted }) => {
+        it(`applies muted=${muted} to the new ${mediaType} owner and source`, () => {
+            const oldSource = `aaaaaaaa-${mediaType[0]}0`;
+            const newSource = `bbbbbbbb-${mediaType[0]}0`;
+            const videoType = mediaType === MediaType.VIDEO ? VideoType.DESKTOP : undefined;
+            const track = new JitsiRemoteTrack(
+                null, conference, 'aaaaaaaa', new MediaStream(),
+                jasmine.createSpyObj<MediaStreamTrack>('mediaTrack', [ 'addEventListener' ]),
+                mediaType, mediaType === MediaType.VIDEO ? VideoType.CAMERA : undefined,
+                1111, !muted, false, oldSource);
+            const muteChanged = jasmine.createSpy('muteChanged');
+
+            track.on(JitsiTrackEvents.TRACK_MUTE_CHANGED,
+                () => muteChanged(track.getParticipantId(), track.getSourceName(), track.isMuted(), track.getVideoType()));
+            useTracks([ track ]);
+            spyOn(signalingLayer, 'getPeerMediaInfo').and.returnValue({ muted, videoType });
+
+            session.processSourceMap({
+                mappedSources: [ { owner: 'bbbbbbbb', rtx: '-1', source: newSource, ssrc: 1111 } ]
+            }, mediaType);
+
+            expect(track.getParticipantId()).toBe('bbbbbbbb');
+            expect(track.getSourceName()).toBe(newSource);
+            expect(track.isMuted()).toBe(muted);
+            expect(track.getVideoType()).toBe(videoType);
+            expect(muteChanged.calls.allArgs()).toEqual([ [ 'bbbbbbbb', newSource, muted, videoType ] ]);
+        });
+    });
+
+    it('gives each track its new source\'s mute state when one source map swaps sources between them', () => {
+        const movedFrom = audioTrack('aaaaaaaa', 'aaaaaaaa-a0', 1111, false);
+        const movedTo = audioTrack('cccccccc', 'cccccccc-a0', 2222, true);
+
+        // movedTo comes first, so a lookup by source name would find it last when searching from the end.
+        useTracks([ movedTo, movedFrom ]);
+        spyOn(signalingLayer, 'getPeerMediaInfo').and.callFake(
+            (_owner: string, _type: MediaType, source: string) => ({ muted: source !== 'aaaaaaaa-a0' }));
+
+        session.processSourceMap({
+            mappedSources: [
+                { owner: 'aaaaaaaa', rtx: '-1', source: 'aaaaaaaa-a0', ssrc: 2222 },
+                { owner: 'dddddddd', rtx: '-1', source: 'dddddddd-a0', ssrc: 1111 }
+            ]
+        }, MediaType.AUDIO);
+
+        expect([ movedTo.getSourceName(), movedTo.isMuted() ]).toEqual([ 'aaaaaaaa-a0', false ]);
+        expect([ movedFrom.getSourceName(), movedFrom.isMuted() ]).toEqual([ 'dddddddd-a0', true ]);
+    });
+});
+
+describe('notifyMySSRCUpdate - P2P source-remove triggers termination', () => {
+    const SID = 'sid12345';
+
+    // Minimal SDP helpers.
+    const SESSION = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n';
+    const AUDIO = 'm=audio 9 RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=sendrecv\r\na=ssrc:11 cname:c\r\n';
+
+    function buildVideoSdp(ssrc: number, sourceName: string): SDP {
+        return new SDP(
+            SESSION + AUDIO
+            + 'm=video 9 RTP/SAVPF 100\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=sendrecv\r\n'
+            + `a=ssrc:${ssrc} cname:c\r\n`
+            + `a=ssrc:${ssrc} msid:stream track\r\n`
+            + `a=ssrc:${ssrc} name:${sourceName}\r\n`
+        );
+    }
+
+    function buildRecvOnlySdp(): SDP {
+        return new SDP(
+            SESSION + AUDIO
+            + 'm=video 9 RTP/SAVPF 100\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=recvonly\r\n'
+        );
+    }
+
+    function createSession(isP2P: boolean): {
+        session: JingleSessionPC; connection: MockStropheConnection; chatRoom: MockChatRoom;
+    } {
+        const connection = new MockStropheConnection();
+
+        (connection as any).connected = true;
+
+        const session = new JingleSessionPC(SID, 'peer1', 'peer2', connection, { }, { }, isP2P, false);
+        const chatRoom = new MockChatRoom();
+
+        session.initialize(
+            chatRoom,
+            new MockRTC(),
+            { setSSRCOwner: () => { }, removeSSRCOwners: () => { } }, // eslint-disable-line no-empty-function
+            { });
+        (session as any).state = JingleSessionState.ACTIVE;
+
+        return { session,
+            connection,
+            chatRoom };
+    }
+
+    it('should emit P2P_TERMINATION_REQUIRED and skip source-remove IQ when SSRCs change on P2P', () => {
+        const { session, connection, chatRoom } = createSession(/* isP2P */ true);
+        const emitSpy = spyOn(chatRoom.eventEmitter, 'emit').and.callThrough();
+        const sendIQSpy = spyOn(connection, 'sendIQ');
+
+        // Simulate browser regenerating SSRCs for the same source during renegotiation.
+        const oldSDP = buildVideoSdp(100, 'endpointA-v0');
+        const newSDP = buildVideoSdp(200, 'endpointA-v0');
+
+        (session as any).notifyMySSRCUpdate(oldSDP, newSDP);
+
+        expect(emitSpy).toHaveBeenCalledWith(XMPPEvents.P2P_TERMINATION_REQUIRED, session);
+        expect(sendIQSpy).not.toHaveBeenCalled();
+    });
+
+    it('should send source-remove IQ and not emit P2P_TERMINATION_REQUIRED on JVB when SSRCs change', () => {
+        const { session, connection, chatRoom } = createSession(/* isP2P */ false);
+        const emitSpy = spyOn(chatRoom.eventEmitter, 'emit').and.callThrough();
+        const sendIQSpy = spyOn(connection, 'sendIQ');
+
+        const oldSDP = buildVideoSdp(100, 'endpointA-v0');
+        const newSDP = buildVideoSdp(200, 'endpointA-v0');
+
+        (session as any).notifyMySSRCUpdate(oldSDP, newSDP);
+
+        expect(sendIQSpy).toHaveBeenCalled();
+        expect(emitSpy).not.toHaveBeenCalledWith(XMPPEvents.P2P_TERMINATION_REQUIRED, jasmine.anything());
+    });
+
+    it('should not emit P2P_TERMINATION_REQUIRED when only a source-add occurs on P2P', () => {
+        const { session, connection, chatRoom } = createSession(/* isP2P */ true);
+        const emitSpy = spyOn(chatRoom.eventEmitter, 'emit').and.callThrough();
+        const sendIQSpy = spyOn(connection, 'sendIQ');
+
+        // Old SDP has no video SSRCs (recvonly); new SDP adds a source - pure source-add, no source-remove.
+        const oldSDP = buildRecvOnlySdp();
+        const newSDP = buildVideoSdp(100, 'endpointA-v0');
+
+        (session as any).notifyMySSRCUpdate(oldSDP, newSDP);
+
+        expect(emitSpy).not.toHaveBeenCalledWith(XMPPEvents.P2P_TERMINATION_REQUIRED, jasmine.anything());
+        expect(sendIQSpy).toHaveBeenCalled();
+    });
+});
+
+describe('JingleSessionPC in-place ICE restart', () => {
+    const SID = 'sid12345';
+    const BRIDGE_SESSION_ID = 'bridge-session-1';
+
+    // The remote (bridge) offer, as it would be found in pc.currentRemoteDescription.
+    const REMOTE_OFFER = [
+        'v=0',
+        'o=- 1 2 IN IP4 127.0.0.1',
+        's=-',
+        't=0 0',
+        'a=group:BUNDLE 0',
+        'm=audio 10000 UDP/TLS/RTP/SAVPF 111',
+        'c=IN IP4 10.0.0.1',
+        'a=mid:0',
+        'a=ice-ufrag:oldfrag',
+        'a=ice-pwd:oldpwdoldpwdoldpwdoldpwd',
+        'a=candidate:1 1 udp 2130706431 10.0.0.1 10000 typ host generation 0',
+        'a=setup:actpass',
+        'a=sendonly',
+        ''
+    ].join('\r\n');
+
+    // The local answer, as it would be found in pc.localDescription after the restart.
+    const LOCAL_ANSWER = [
+        'v=0',
+        'o=- 1 2 IN IP4 127.0.0.1',
+        's=-',
+        't=0 0',
+        'a=group:BUNDLE 0',
+        'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+        'c=IN IP4 0.0.0.0',
+        'a=mid:0',
+        'a=ice-ufrag:mynewfrag',
+        'a=ice-pwd:mynewpwdmynewpwdmynewpwd',
+        'a=fingerprint:sha-256 AA:BB',
+        'a=setup:active',
+        'a=recvonly',
+        ''
+    ].join('\r\n');
+
+    /**
+     * Builds the <transport> element of an in-place ICE restart 'transport-info'.
+     *
+     * @param {Object} options - Overrides for the transport attributes.
+     * @returns {Element}
+     */
+    function buildBridgeTransport({
+        generation = 1,
+        ufrag = 'brnewfrag',
+        pwd = 'brnewpwd',
+        numCandidates = 2
+    }: {
+        generation?: unknown; numCandidates?: number; pwd?: Nullable<string>; ufrag?: Nullable<string>;
+    } = {}): Element {
+        const candidates = [];
+
+        for (let i = 0; i < numCandidates; i++) {
+            candidates.push(`<candidate component="1" foundation="${i + 1}" generation="0" id="cand${i}" `
+                + `ip="10.0.0.${i + 1}" network="0" port="${10000 + i}" priority="2130706431" protocol="udp" `
+                + 'type="host"/>');
+        }
+
+        const attributes = [ `ice-generation="${generation}"` ];
+
+        ufrag !== null && attributes.push(`ufrag="${ufrag}"`);
+        pwd !== null && attributes.push(`pwd="${pwd}"`);
+
+        const iq = parseXML(
+            '<jingle action="transport-info" initiator="focus" sid="sid12345" xmlns="urn:xmpp:jingle:1">'
+            + '<content name="audio">'
+            + `<transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ${attributes.join(' ')}>`
+            + candidates.join('')
+            + '</transport>'
+            + '</content>'
+            + '</jingle>');
+
+        return findFirst(iq, 'content>transport');
+    }
+
+    /**
+     * Creates a JVB session with a peer connection mocked up for an ICE restart.
+     *
+     * @returns {Object}
+     */
+    function createJvbSession() {
+        const connection = new MockStropheConnection();
+
+        (connection as any).connected = true;
+
+        const session = new JingleSessionPC(SID, 'peer1', 'focus', connection, { }, { }, false, false);
+
+        session.initialize(
+            new MockChatRoom(),
+            new MockRTC(),
+            { setSSRCOwner: () => { }, removeSSRCOwners: () => { } }, // eslint-disable-line no-empty-function
+            { });
+        (session as any).state = JingleSessionState.ACTIVE;
+        (session as any)._bridgeSessionId = BRIDGE_SESSION_ID;
+
+        // The modification queue starts paused; it is normally resumed when the offer is accepted.
+        (session as any).modificationQueue.resume();
+
+        const tpc = session.peerconnection as any;
+        const nativePc = {
+            currentRemoteDescription: { sdp: REMOTE_OFFER },
+            iceConnectionState: 'connected',
+            signalingState: 'stable'
+        };
+
+        tpc.peerconnection = nativePc;
+        tpc.addIceCandidate = jasmine.createSpy('addIceCandidate').and.returnValue(Promise.resolve());
+        Object.defineProperty(tpc, 'localDescription', { get: () => ({ sdp: LOCAL_ANSWER }) });
+        Object.defineProperty(tpc, 'remoteDescription', { get: () => ({ sdp: REMOTE_OFFER }) });
+        spyOn(tpc, 'setRemoteDescription').and.returnValue(Promise.resolve());
+        spyOn(tpc, 'createAnswer').and.returnValue(Promise.resolve({ sdp: LOCAL_ANSWER,
+            type: 'answer' }));
+        spyOn(tpc, 'setLocalDescription').and.returnValue(Promise.resolve());
+
+        // The restart goes through _renegotiate(), which signals any SSRCs the browser regenerates. That is not
+        // what these tests are about, and it would try to send a source-update.
+        spyOn(session as any, 'notifyMySSRCUpdate');
+
+        return { connection,
+            nativePc,
+            session,
+            tpc };
+    }
+
+    /**
+     * Resolves once every task queued on the session's modification queue has run.
+     *
+     * @param {JingleSessionPC} session - The session.
+     * @returns {Promise<void>}
+     */
+    function drainQueue(session: JingleSessionPC): Promise<void> {
+        return new Promise<void>(resolve => {
+            (session as any).modificationQueue.push(
+                finished => finished(),
+                () => resolve());
+        });
+    }
+
+    describe('restartIce', () => {
+        it('sends a session-info with a bridge-session requesting an ICE restart', async () => {
+            const { connection, session } = createJvbSession();
+
+            await session.restartIce(IceRestartReason.API);
+
+            expect(connection.sentIQs.length).toBe(1);
+
+            const iq = connection.sentIQs[0].tree();
+
+            expect(findFirst(iq, 'jingle').getAttribute('action')).toBe('session-info');
+            expect(findFirst(iq, 'jingle').getAttribute('sid')).toBe(SID);
+
+            const bridgeSession = findFirst(iq, 'jingle>bridge-session');
+
+            expect(bridgeSession.getAttribute('xmlns')).toBe('http://jitsi.org/protocol/focus');
+            expect(bridgeSession.getAttribute('id')).toBe(BRIDGE_SESSION_ID);
+            expect(bridgeSession.getAttribute('ice-restart')).toBe('true');
+        });
+
+        it('rejects without sending anything when no bridge session is known', async () => {
+            const { connection, session } = createJvbSession();
+
+            (session as any)._bridgeSessionId = null;
+
+            await expectAsync(session.restartIce(IceRestartReason.API)).toBeRejected();
+            expect(connection.sentIQs.length).toBe(0);
+        });
+
+        it('rejects for a P2P session', async () => {
+            const { session } = createJvbSession();
+
+            (session as any).isP2P = true;
+
+            await expectAsync(session.restartIce(IceRestartReason.API)).toBeRejected();
+        });
+    });
+
+    describe('onBridgeIceRestartTransport', () => {
+        it('applies the patched offer, answers it and only then adds the candidates', async () => {
+            const { nativePc, session, tpc } = createJvbSession();
+
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 1 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(1);
+
+            const applied = tpc.setRemoteDescription.calls.mostRecent().args[0];
+
+            expect(applied.type).toBe('offer');
+            expect(applied.sdp).toContain('a=ice-ufrag:brnewfrag');
+            expect(applied.sdp).toContain('a=ice-pwd:brnewpwd');
+            expect(applied.sdp).not.toContain('a=candidate:');
+
+            expect(tpc.createAnswer).toHaveBeenCalledTimes(1);
+            expect(tpc.setLocalDescription).toHaveBeenCalledTimes(1);
+            expect(tpc.addIceCandidate).toHaveBeenCalledTimes(2);
+
+            // The candidates must be added after the offer/answer, not as part of it.
+            expect(tpc.addIceCandidate.calls.first().invocationOrder)
+                .toBeGreaterThan(tpc.setLocalDescription.calls.first().invocationOrder);
+        });
+
+        it('signals the new local ICE credentials back tagged with the same generation', async () => {
+            const { connection, session } = createJvbSession();
+
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 7 }));
+            await drainQueue(session);
+
+            expect(connection.sentIQs.length).toBe(1);
+
+            const iq = connection.sentIQs[0].tree();
+
+            expect(findFirst(iq, 'jingle').getAttribute('action')).toBe('transport-info');
+
+            const transport = findFirst(iq, 'jingle>content>transport');
+
+            expect(transport.getAttribute('ice-generation')).toBe('7');
+            expect(transport.getAttribute('ufrag')).toBe('mynewfrag');
+            expect(transport.getAttribute('pwd')).toBe('mynewpwdmynewpwdmynewpwd');
+        });
+
+        it('ignores a generation that is not newer than the last one applied', async () => {
+            const { connection, session, tpc } = createJvbSession();
+
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 3 }));
+            await drainQueue(session);
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(1);
+
+            // A duplicate and an out-of-order (older) push must both be dropped.
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 3 }));
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 2 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(1);
+            expect(connection.sentIQs.length).toBe(1);
+
+            // A newer one is applied.
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 4 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(2);
+            expect(connection.sentIQs.length).toBe(2);
+        });
+
+        it('ignores a transport with an invalid generation', async () => {
+            const { session, tpc } = createJvbSession();
+
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 'not-a-number' }));
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 0 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).not.toHaveBeenCalled();
+        });
+
+        it('ignores a transport with incomplete ICE credentials', async () => {
+            const { session, tpc } = createJvbSession();
+
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ pwd: null }));
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ ufrag: null }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).not.toHaveBeenCalled();
+        });
+
+        it('still applies a newer generation after one failed to apply', async () => {
+            const { session, tpc } = createJvbSession();
+
+            tpc.setRemoteDescription.and.returnValue(Promise.reject(new Error('nope')));
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 1 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(1);
+
+            // The same generation is not retried, but a newer one still is.
+            tpc.setRemoteDescription.and.returnValue(Promise.resolve());
+            session.onBridgeIceRestartTransport(buildBridgeTransport({ generation: 2 }));
+            await drainQueue(session);
+
+            expect(tpc.setRemoteDescription).toHaveBeenCalledTimes(2);
+        });
+    });
+
+});
+
+describe('JingleSessionPC media connectivity', () => {
+    const HOST_CANDIDATE = {
+        candidate: 'candidate:1 1 udp 2122260223 10.0.0.1 54321 typ host generation 0',
+        protocol: 'udp',
+        type: 'host'
+    };
+    let room;
+    let rtc;
+    let pc;
+    let sendAnalytics;
+    let session: JingleSessionPC;
+
+    beforeEach(() => {
+        room = new MockChatRoom();
+        room.connectionTimes = {};
+        rtc = new MockRTC();
+        sendAnalytics = spyOn(Statistics, 'sendAnalytics');
+
+        // Another spec can leave SSRC rewriting on, which starts the audio wedge detector the mocks can't serve.
+        spyOn(FeatureFlags, 'isSsrcRewritingSupported').and.returnValue(false);
+        session = new JingleSessionPC('sid', 'peer1', 'focus', new MockStropheConnection(), { },
+            { iceServers: [ { urls: 'turn:turn.example.com:443' } ] }, false, false);
+        session.initialize(
+            room,
+            rtc,
+            // eslint-disable-next-line no-empty-function
+            { clearSyntheticSourceKinds: () => { }, setSSRCOwner: () => { }, removeSSRCOwners: () => { } },
+            { webrtcIceTcpDisable: true });
+        pc = session.peerconnection;
+    });
+
+    it('reports host-only gathering, skipping candidates of disabled protocols', () => {
+        const emit = spyOn(room.eventEmitter, 'emit');
+
+        pc.onicecandidateerror({ errorCode: 701, url: 'turn:turn.example.com:443' });
+        pc.onicecandidate({ candidate: { ...HOST_CANDIDATE, protocol: 'tcp', type: 'srflx' } });
+        pc.onicecandidate({ candidate: HOST_CANDIDATE });
+        pc.onicecandidate({ candidate: null });
+
+        const connectivity = session.getMediaConnectivity();
+
+        expect(connectivity).toEqual(jasmine.objectContaining({
+            candidates: { host: 1, prflx: 0, relay: 0, srflx: 0 },
+            iceServerErrors: [ { errorCode: 701, url: 'turn:turn.example.com:443' } ],
+            status: MediaConnectivityStatus.AT_RISK
+        }));
+        expect(emit).toHaveBeenCalledWith(XMPPEvents.MEDIA_CONNECTIVITY_CHANGED, session, connectivity);
+        expect(sendAnalytics).toHaveBeenCalledWith(AnalyticsEvents.MEDIA_CONNECTIVITY_CHANGED, jasmine.objectContaining({
+            'host_candidates': 1,
+            reasons: 'no-server-reflexive,turn-unreachable',
+            status: MediaConnectivityStatus.AT_RISK
+        }));
+    });
+
+    it('reports an ICE failure and disposes the monitor on close', () => {
+        pc.iceConnectionState = 'failed';
+        pc.oniceconnectionstatechange();
+        expect(session.getMediaConnectivity()?.status).toBe(MediaConnectivityStatus.FAILED);
+
+        session.close();
+        expect(session.getMediaConnectivity()).toBeUndefined();
+    });
+
+    it('reports a PeerConnection failure that Chrome doesn\'t reflect in the ICE state', () => {
+        pc.iceConnectionState = 'disconnected';
+        pc.connectionState = 'failed';
+        pc.onconnectionstatechange();
+
+        expect(session.getMediaConnectivity()?.status).toBe(MediaConnectivityStatus.FAILED);
+    });
+
+    it('reports an interruption when the bridge session is terminated while media flows', async () => {
+        const emit = spyOn(room.eventEmitter, 'emit');
+
+        pc.getStats = () => Promise.resolve(new Map());
+        pc.iceConnectionState = 'connected';
+        pc.oniceconnectionstatechange();
+        await nextTick();
+        session.onTerminated('success', 'reinvite requested');
+
+        expect(emit).toHaveBeenCalledWith(XMPPEvents.MEDIA_CONNECTIVITY_CHANGED, session, jasmine.objectContaining({
+            reasons: [ MediaConnectivityReason.SESSION_ENDED ],
+            status: MediaConnectivityStatus.INTERRUPTED
+        }));
+        expect(session.getMediaConnectivity()).toBeUndefined();
+    });
+
+    it('follows the selected pair from its own peerconnection\'s stats poll until closed', async () => {
+        const tcpRelay = {
+            local: { candidateType: 'relay', id: 'L1', protocol: 'udp', relayProtocol: 'tls', type: 'local-candidate' },
+            pair: { id: 'CP1', type: 'candidate-pair' }
+        };
+
+        pc.getStats = () => Promise.resolve(new Map());
+        pc.iceConnectionState = 'connected';
+        pc.oniceconnectionstatechange();
+        await nextTick();
+        expect(session.getMediaConnectivity()?.status).toBe(MediaConnectivityStatus.GOOD);
+
+        rtc.eventEmitter.emit(RTCEvents.SELECTED_CANDIDATE_PAIR_STATS, { }, tcpRelay);
+        expect(session.getMediaConnectivity()?.status).toBe(MediaConnectivityStatus.GOOD);
+
+        rtc.eventEmitter.emit(RTCEvents.SELECTED_CANDIDATE_PAIR_STATS, pc, tcpRelay);
+        expect(session.getMediaConnectivity()?.status).toBe(MediaConnectivityStatus.DEGRADED);
+
+        session.close();
+        expect(rtc.eventEmitter.listenerCount(RTCEvents.SELECTED_CANDIDATE_PAIR_STATS)).toBe(0);
+    });
+});

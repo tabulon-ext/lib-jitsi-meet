@@ -1,16 +1,16 @@
-/* globals $ */
-
-import { getLogger } from 'jitsi-meet-logger';
+import { getLogger } from '@jitsi/logger';
 import { $iq } from 'strophe.js';
 
-import * as MediaType from '../../service/RTC/MediaType';
-import VideoType from '../../service/RTC/VideoType';
+import { findFirst, getAttribute, parseXML } from '../../modules/util/XMLUtils';
+import { MediaType } from '../../service/RTC/MediaType';
+import { getSourceNameForJitsiTrack } from '../../service/RTC/SignalingLayer';
+import { VideoType } from '../../service/RTC/VideoType';
 import RTC from '../RTC/RTC';
 
 import ProxyConnectionPC from './ProxyConnectionPC';
 import { ACTIONS } from './constants';
 
-const logger = getLogger(__filename);
+const logger = getLogger('proxyconnection:ProxyConnectionService');
 
 /**
  * Instantiates a new ProxyConnectionPC and ensures only one exists at a given
@@ -97,8 +97,8 @@ export default class ProxyConnectionService {
         }
 
         const iq = this._convertStringToXML(message.data.iq);
-        const $jingle = iq && iq.find('jingle');
-        const action = $jingle && $jingle.attr('action');
+        const jingleElement = findFirst(iq, 'jingle');
+        const action = getAttribute(jingleElement, 'action');
 
         if (action === ACTIONS.INITIATE) {
             this._peerConnection = this._createPeerConnection(peerJid, {
@@ -109,8 +109,8 @@ export default class ProxyConnectionService {
 
         // Truthy check for peer connection added to protect against possibly
         // receiving actions before an ACTIONS.INITIATE.
-        if (this._peerConnection) {
-            this._peerConnection.processMessage($jingle);
+        if (this._peerConnection && jingleElement) {
+            this._peerConnection.processMessage(jingleElement);
         }
 
         // Take additional steps to ensure the peer connection is cleaned up
@@ -121,7 +121,7 @@ export default class ProxyConnectionService {
             this._selfCloseConnection();
         }
 
-        return;
+
     }
 
     /**
@@ -137,6 +137,12 @@ export default class ProxyConnectionService {
         this._peerConnection = this._createPeerConnection(peerJid, {
             isInitiator: true,
             receiveVideo: false
+        });
+
+        localTracks.forEach((localTrack, localTrackIndex) => {
+            const localSourceNameTrack = getSourceNameForJitsiTrack('peer', localTrack.getType(), localTrackIndex);
+
+            localTrack.setSourceName(localSourceNameTrack);
         });
 
         this._peerConnection.start(localTracks);
@@ -156,18 +162,18 @@ export default class ProxyConnectionService {
     }
 
     /**
-     * Transforms a stringified xML into a XML wrapped in jQuery.
+     * Transforms a stringified xML into a XML element.
      *
      * @param {string} xml - The XML in string form.
      * @private
-     * @returns {Object|null} A jQuery version of the xml. Null will be returned
+     * @returns {Object|null} An element version of the xml. Null will be returned
      * if an error is encountered during transformation.
      */
     _convertStringToXML(xml) {
         try {
-            const xmlDom = new DOMParser().parseFromString(xml, 'text/xml');
+            const xmlDom = parseXML(xml);
 
-            return $(xmlDom);
+            return xmlDom;
         } catch (e) {
             logger.error('Attempted to convert incorrectly formatted xml');
 
@@ -192,10 +198,10 @@ export default class ProxyConnectionService {
         }
 
         const pcOptions = {
-            pcConfig: this._options.pcConfig,
             onError: this._onFatalError,
             onRemoteStream: this._onRemoteStream,
             onSendMessage: this._onSendMessage,
+            pcConfig: this._options.pcConfig,
             peerJid,
             ...options
         };
@@ -212,7 +218,7 @@ export default class ProxyConnectionService {
      * attempted or started, and to which an iq with error details should be
      * sent.
      * @param {string} errorType - The constant indicating the type of the error
-     * that occured.
+     * that occurred.
      * @param {string} details - Optional additional data about the error.
      * @private
      * @returns {void}
@@ -226,8 +232,8 @@ export default class ProxyConnectionService {
             type: 'set'
         })
             .c('jingle', {
-                xmlns: 'urn:xmpp:jingle:1',
-                action: errorType
+                action: errorType,
+                xmlns: 'urn:xmpp:jingle:1'
             })
             .c('details')
             .t(details)
